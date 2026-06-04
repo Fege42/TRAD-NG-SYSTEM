@@ -1,0 +1,229 @@
+local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+if ServerScriptService:FindFirstChild("AntiExploitSystem") then 
+    ServerScriptService.AntiExploitSystem:Destroy() 
+end
+
+local antiExploitSystem = Instance.new("Folder")
+antiExploitSystem.Name = "AntiExploitSystem"
+antiExploitSystem.Parent = ServerScriptService
+
+local antiExploitManager = Instance.new("ModuleScript")
+antiExploitManager.Name = "AntiExploitManager"
+antiExploitManager.Source = [=[--!strict
+local AntiExploitManager = {}
+AntiExploitManager.__index = AntiExploitManager
+
+local Players = game:GetService("Players")
+
+local CONFIG = {
+	CHECK_INTERVAL = 0.5,
+	SPEED_BUFFER = 5,
+	MAX_VERTICAL_SPEED = 65,
+	MAX_AIR_TIME = 4.0,
+	RAYCAST_DOWN_DISTANCE = 15,
+	STRIKE_LIMIT = 5,
+	REMOTE_RESET_INTERVAL = 1.0,
+	MAX_REMOTE_CALLS = 25,
+}
+
+local sessions = {}
+local remoteTrackers = {}
+
+type PlayerSession = {
+	LastPosition: Vector3,
+	LastActive: number,
+	AirTime: number,
+	Strikes: number,
+	IsExempt: boolean,
+	ExemptExpiry: number
+}
+
+local function isPlayerGrounded(character: Model, rootPart: BasePart): boolean
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {character}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	
+	local result = workspace:Raycast(rootPart.Position, Vector3.new(0, -CONFIG.RAYCAST_DOWN_DISTANCE, 0), params)
+	return result ~= nil
+end
+
+function AntiExploitManager.NewSession(player: Player): PlayerSession?
+	if sessions[player] then return sessions[player] end
+	
+	local character = player.Character or player.CharacterAdded:Wait()
+	local rootPart = character:WaitForChild("HumanoidRootPart", 5) :: BasePart
+	
+	if not rootPart then return nil end
+	
+	local session: PlayerSession = {
+		LastPosition = rootPart.Position,
+		LastActive = os.clock(),
+		AirTime = 0,
+		Strikes = 0,
+		IsExempt = false,
+		ExemptExpiry = 0
+	}
+	
+	sessions[player] = session
+	remoteTrackers[player] = {
+		LastReset = os.clock(),
+		Count = 0
+	}
+	
+	return session
+end
+
+function AntiExploitManager:ExemptPlayerForTeleport(player: Player, duration: number)
+	local session = sessions[player]
+	if session then
+		session.IsExempt = true
+		session.ExemptExpiry = os.clock() + duration
+	end
+end
+
+function AntiExploitManager:FlagPlayer(player: Player, session: PlayerSession, reason: string)
+	session.Strikes += 1
+	warn(string.format("[Anti-Exploit Check] Flagged %s for %s. Strikes: %d/%d", player.Name, reason, session.Strikes, CONFIG.STRIKE_LIMIT))
+	
+	local character = player.Character
+	if character then
+		local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart
+		if rootPart then
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart:PivotTo(CFrame.new(session.LastPosition))
+		end
+	end
+	
+	if session.Strikes >= CONFIG.STRIKE_LIMIT then
+		player:Kick("\n[Server Security] Unexpected client-server synchronization anomaly detected.")
+	end
+end
+
+function AntiExploitManager:TrackMovement(player: Player, session: PlayerSession)
+	local character = player.Character
+	if not character then return end
+	
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart
+	
+	if not humanoid or not rootPart or humanoid.Health <= 0 then return end
+	
+	local now = os.clock()
+	local deltaTime = now - session.LastActive
+	session.LastActive = now
+	
+	if session.IsExempt then
+		if now > session.ExemptExpiry then
+			session.IsExempt = false
+			session.LastPosition = rootPart.Position
+		end
+		return
+	end
+	
+	local currentPos = rootPart.Position
+	local previousPos = session.LastPosition
+	
+	local horizontalDelta = Vector3.new(currentPos.X - previousPos.X, 0, currentPos.Z - previousPos.Z).Magnitude
+	local verticalDelta = currentPos.Y - previousPos.Y
+	
+	local maxExpectedHorizontal = (humanoid.WalkSpeed + CONFIG.SPEED_BUFFER) * deltaTime
+	if horizontalDelta > maxExpectedHorizontal and horizontalDelta > 5 then
+		self:FlagPlayer(player, session, "Speed/Teleport Exploitation")
+		return
+	end
+	
+	local state = humanoid:GetState()
+	local isAirborne = state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping
+	
+	if isAirborne and not isPlayerGrounded(character, rootPart) then
+		session.AirTime += deltaTime
+		
+		if verticalDelta / deltaTime > CONFIG.MAX_VERTICAL_SPEED then
+			self:FlagPlayer(player, session, "Abnormal Vertical Velocity")
+			return
+		elseif session.AirTime > CONFIG.MAX_AIR_TIME then
+			self:FlagPlayer(player, session, "Fly / Levitation Exploitation")
+			return
+		end
+	else
+		session.AirTime = 0
+	end
+	
+	session.LastPosition = currentPos
+end
+
+function AntiExploitManager:VerifyRemoteInvocation(player: Player): boolean
+	local tracker = remoteTrackers[player]
+	if not tracker then return true end
+	
+	local now = os.clock()
+	if now - tracker.LastReset >= CONFIG.REMOTE_RESET_INTERVAL then
+		tracker.Count = 1
+		tracker.LastReset = now
+		return true
+	end
+	
+	tracker.Count += 1
+	if tracker.Count > CONFIG.MAX_REMOTE_CALLS then
+		local session = sessions[player]
+		if session then
+			self:FlagPlayer(player, session, "Remote Event Throttling Violations (Spam)")
+		else
+			player:Kick("[Server Security] Excessive network requests.")
+		end
+		return false
+	end
+	
+	return true
+end
+
+function AntiExploitManager:EndSession(player: Player)
+	sessions[player] = nil
+	remoteTrackers[player] = nil
+end
+
+return AntiExploitManager]=]
+antiExploitManager.Parent = antiExploitSystem
+
+local antiExploitServer = Instance.new("Script")
+antiExploitServer.Name = "AntiExploitServer"
+antiExploitServer.Source = [=[--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local AntiExploitManager = require(script.Parent.AntiExploitManager)
+
+local CHECK_INTERVAL = 0.5
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		task.wait(1)
+		AntiExploitManager.NewSession(player)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	AntiExploitManager:EndSession(player)
+end)
+
+ReplicatedStorage.DescendantAdded:Connect(function(descendant)
+	if descendant:IsA("RemoteEvent") then
+		descendant.OnServerEvent:Connect(function(player)
+			AntiExploitManager:VerifyRemoteInvocation(player)
+		end)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CHECK_INTERVAL)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local session = AntiExploitManager.NewSession(player)
+			if session then
+				AntiExploitManager:TrackMovement(player, session)
+			end
+		end
+	end
+end)]=]
+antiExploitServer.Parent = antiExploitSystem
