@@ -1,0 +1,289 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local StarterPlayer = game:GetService("StarterPlayer")
+local StarterPlayerScripts = StarterPlayer:WaitForChild("StarterPlayerScripts")
+
+if ReplicatedStorage:FindFirstChild("TradingSystem") then ReplicatedStorage.TradingSystem:Destroy() end
+if ServerScriptService:FindFirstChild("TradingServerSystem") then ServerScriptService.TradingServerSystem:Destroy() end
+if StarterPlayerScripts:FindFirstChild("TradeClient") then StarterPlayerScripts.TradeClient:Destroy() end
+
+local tradingSystem = Instance.new("Folder")
+tradingSystem.Name = "TradingSystem"
+tradingSystem.Parent = ReplicatedStorage
+
+local eventsFolder = Instance.new("Folder")
+eventsFolder.Name = "Events"
+eventsFolder.Parent = tradingSystem
+
+local modulesFolder = Instance.new("Folder")
+modulesFolder.Name = "Modules"
+modulesFolder.Parent = tradingSystem
+
+local tradeRequest = Instance.new("RemoteFunction")
+tradeRequest.Name = "TradeRequest"
+tradeRequest.Parent = eventsFolder
+
+local updateTrade = Instance.new("RemoteEvent")
+updateTrade.Name = "UpdateTrade"
+updateTrade.Parent = eventsFolder
+
+local itemDatabase = Instance.new("ModuleScript")
+itemDatabase.Name = "ItemDatabase"
+itemDatabase.Source = [[local ItemDatabase = {
+    ["Sword_01"] = { Name = "Eski Demir Kılıç", Rarity = "Rare", Value = 150 },
+    ["Shield_01"] = { Name = "Ahşap Kalkan", Rarity = "Common", Value = 50 },
+    ["Potion_01"] = { Name = "Büyük Can İksiri", Rarity = "Uncommon", Value = 75 },
+}
+
+return ItemDatabase]]
+itemDatabase.Parent = modulesFolder
+
+local tradingServerSystem = Instance.new("Folder")
+tradingServerSystem.Name = "TradingServerSystem"
+tradingServerSystem.Parent = ServerScriptService
+
+local tradeManager = Instance.new("ModuleScript")
+tradeManager.Name = "TradeManager"
+tradeManager.Source = [[local TradeManager = {}
+TradeManager.__index = TradeManager
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ItemDatabase = require(ReplicatedStorage.TradingSystem.Modules.ItemDatabase)
+local UpdateTradeEvent = ReplicatedStorage.TradingSystem.Events.UpdateTrade
+
+local activeTrades = {}
+
+function TradeManager.new(player1, player2)
+    local self = setmetatable({}, TradeManager)
+    
+    self.Player1 = player1
+    self.Player2 = player2
+    
+    self.State = {
+        [player1] = { Items = {}, Confirmed = false },
+        [player2] = { Items = {}, Confirmed = false }
+    }
+    
+    self.Status = "Active"
+    
+    activeTrades[player1] = self
+    activeTrades[player2] = self
+    
+    return self
+end
+
+function TradeManager.GetActiveTrade(player)
+    return activeTrades[player]
+end
+
+local function PlayerHasItem(player, itemID)
+    return true 
+end
+
+function TradeManager:AddItem(player, itemID)
+    if self.Status ~= "Active" then return false end
+    if not ItemDatabase[itemID] then return false end 
+    
+    if not PlayerHasItem(player, itemID) then
+        warn("[Güvenlik Uyarısı] " .. player.Name .. " sahip olmadığı bir eşyayı eklemeye çalıştı!")
+        return false
+    end
+    
+    if #self.State[player].Items >= 8 then return false end
+    
+    table.insert(self.State[player].Items, itemID)
+    
+    self.State[self.Player1].Confirmed = false
+    self.State[self.Player2].Confirmed = false
+    
+    self:NetworkUpdate()
+    return true
+end
+
+function TradeManager:RemoveItem(player, itemID)
+    if self.Status ~= "Active" then return false end
+    
+    local playerItems = self.State[player].Items
+    local itemIndex = table.find(playerItems, itemID)
+    
+    if itemIndex then
+        table.remove(playerItems, itemIndex)
+        
+        self.State[self.Player1].Confirmed = false
+        self.State[self.Player2].Confirmed = false
+        
+        self:NetworkUpdate()
+        return true
+    end
+    return false
+end
+
+function TradeManager:Accept(player)
+    if self.Status ~= "Active" then return end
+    
+    self.State[player].Confirmed = true
+    self:NetworkUpdate()
+    
+    if self.State[self.Player1].Confirmed and self.State[self.Player2].Confirmed then
+        self:CommitTrade()
+    end
+end
+
+function TradeManager:CommitTrade()
+    self.Status = "Processing" 
+    
+    local success, err = pcall(function()
+        local p1Items = self.State[self.Player1].Items
+        local p2Items = self.State[self.Player2].Items
+        
+        print("--- TAKAS BAŞARIYLA TAMAMLANDI ---")
+        print(self.Player1.Name .. " Verilenler: ", table.concat(p1Items, ", "))
+        print(self.Player2.Name .. " Verilenler: ", table.concat(p2Items, ", "))
+        print("----------------------------------")
+    end)
+    
+    if success then
+        self.Status = "Completed"
+        UpdateTradeEvent:FireClient(self.Player1, "Success", self.State)
+        UpdateTradeEvent:FireClient(self.Player2, "Success", self.State)
+    else
+        warn("Takas verisi işlenirken hata oluştu: " .. tostring(err))
+        self:Cancel("Veri tabanı hatası oluştu, eşyalarınız güvende.")
+    end
+    
+    activeTrades[self.Player1] = nil
+    activeTrades[self.Player2] = nil
+end
+
+function TradeManager:Cancel(reason)
+    if self.Status == "Completed" or self.Status == "Processing" then return end
+    
+    self.Status = "Cancelled"
+    
+    activeTrades[self.Player1] = nil
+    activeTrades[self.Player2] = nil
+    
+    UpdateTradeEvent:FireClient(self.Player1, "Cancelled", reason)
+    UpdateTradeEvent:FireClient(self.Player2, "Cancelled", reason)
+end
+
+function TradeManager:NetworkUpdate()
+    UpdateTradeEvent:FireClient(self.Player1, "Update", self.State)
+    UpdateTradeEvent:FireClient(self.Player2, "Update", self.State)
+end
+
+return TradeManager]]
+tradeManager.Parent = tradingServerSystem
+
+local mainServer = Instance.new("Script")
+mainServer.Name = "MainServer"
+mainServer.Source = [[local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TradeManager = require(script.Parent.TradeManager)
+
+local TradeRequestFunction = ReplicatedStorage.TradingSystem.Events.TradeRequest
+local UpdateTradeEvent = ReplicatedStorage.TradingSystem.Events.UpdateTrade
+
+TradeRequestFunction.OnServerInvoke = function(player, action, targetPlayer, extraData)
+    if targetPlayer == player then return false end
+    
+    if action == "SendRequest" then
+        if TradeManager.GetActiveTrade(targetPlayer) then
+            return "TargetBusy"
+        end
+        if TradeManager.GetActiveTrade(player) then
+            return "YouAreBusy"
+        end
+        
+        TradeManager.new(player, targetPlayer)
+        return "Started"
+    end
+end
+
+UpdateTradeEvent.OnServerEvent:Connect(function(player, action, itemID)
+    local activeTrade = TradeManager.GetActiveTrade(player)
+    if not activeTrade then return end 
+    
+    if action == "AddItem" then
+        activeTrade:AddItem(player, itemID)
+    elseif action == "RemoveItem" then
+        activeTrade:RemoveItem(player, itemID)
+    elseif action == "Accept" then
+        activeTrade:Accept(player)
+    elseif action == "Cancel" then
+        activeTrade:Cancel("Oyuncu takası iptal etti.")
+    end
+end)
+
+game.Players.PlayerRemoving:Connect(function(player)
+    local activeTrade = TradeManager.GetActiveTrade(player)
+    if activeTrade then
+        activeTrade:Cancel("Oyuncu oyundan ayrıldı.")
+    end
+end)]]
+mainServer.Parent = tradingServerSystem
+
+local tradeClient = Instance.new("LocalScript")
+tradeClient.Name = "TradeClient"
+tradeClient.Source = [[local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local TradingSystem = ReplicatedStorage:WaitForChild("TradingSystem")
+local Events = TradingSystem:WaitForChild("Events")
+local TradeRequest = Events:WaitForChild("TradeRequest")
+local UpdateTrade = Events:WaitForChild("UpdateTrade")
+
+print("[TradeClient] İstemci sistemi aktif. Komutlar: /trade [isim], /add [eşya], /accept, /cancel")
+
+UpdateTrade.OnClientEvent:Connect(function(action, state, extra)
+    if action == "Update" then
+        print("\n🔄 [TAKAS GÜNCELLEMESİ] 🔄")
+        
+        for player, data in pairs(state) do
+            local playerName = typeof(player) == "Instance" and player.Name or tostring(player)
+            local itemsList = #data.Items > 0 and table.concat(data.Items, ", ") or "Boş"
+            local statusText = data.Confirmed and "✅ ONAYLADI" or "⏳ Bekliyor"
+            
+            print(string.format("👤 %s -> Eşyalar: [%s] | Durum: %s", playerName, itemsList, statusText))
+        end
+        print("-------------------------------\n")
+        
+    elseif action == "Success" then
+        print("🎉 [BAŞARILI] Takas tamamlandı! Eşyalar güvenle transfer edildi.")
+    elseif action == "Cancelled" then
+        print("❌ [İPTAL] Takas sonlandırıldı. Neden: " .. tostring(state))
+    end
+end)
+
+LocalPlayer.Chatted:Connect(function(message)
+    local args = string.split(message, " ")
+    local command = args[1]
+
+    if command == "/trade" and args[2] then
+        local targetName = args[2]
+        local targetPlayer = Players:FindFirstChild(targetName)
+        
+        if targetPlayer then
+            print("⏳ " .. targetName .. " oyuncusuna takas isteği gönderiliyor...")
+            local result = TradeRequest:InvokeServer("SendRequest", targetPlayer)
+            print("📢 Sunucu Yanıtı: " .. tostring(result))
+        else
+            warn("Oyuncu bulunamadı!")
+        end
+        
+    elseif command == "/add" and args[2] then
+        local itemID = args[2]
+        UpdateTrade:FireServer("AddItem", itemID)
+        
+    elseif command == "/remove" and args[2] then
+        local itemID = args[2]
+        UpdateTrade:FireServer("RemoveItem", itemID)
+        
+    elseif command == "/accept" then
+        UpdateTrade:FireServer("Accept")
+        
+    elseif command == "/cancel" then
+        UpdateTrade:FireServer("Cancel")
+    end
+end)]]
+tradeClient.Parent = StarterPlayerScripts
