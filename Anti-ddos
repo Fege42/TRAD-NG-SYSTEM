@@ -1,0 +1,179 @@
+local ServerScriptService = game:GetService("ServerScriptService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+if ServerScriptService:FindFirstChild("AntiDdosSystem") then 
+	ServerScriptService.AntiDdosSystem:Destroy() 
+end
+
+local antiDdosSystem = Instance.new("Folder")
+antiDdosSystem.Name = "AntiDdosSystem"
+antiDdosSystem.Parent = ServerScriptService
+
+local antiDdosManager = Instance.new("ModuleScript")
+antiDdosManager.Name = "AntiDdosManager"
+antiDdosManager.Source = [=[--!strict
+local AntiDdosManager = {}
+AntiDdosManager.__index = AntiDdosManager
+
+local Players = game:GetService("Players")
+
+local CONFIG = {
+	TIME_WINDOW = 1.0,            
+	MAX_TOTAL_REQUESTS = 60,      
+	MAX_SPECIFIC_REMOTE_REQ = 25, 
+	MAX_STRING_SIZE = 10000,      
+	MAX_TABLE_DEPTH = 4,          
+	VIOLATION_LIMIT = 3,          
+}
+
+local networkLogs = {}
+
+type RemoteLog = {
+	TotalCount: number,
+	WindowStart: number,
+	PerRemote: { [string]: number },
+	Violations: number
+}
+
+local function calculateTableDepth(tab: any, currentDepth: number): number
+	if type(tab) ~= "table" then return currentDepth end
+	if currentDepth > CONFIG.MAX_TABLE_DEPTH then return currentDepth end
+	
+	local maxDepth = currentDepth
+	for _, value in pairs(tab) do
+		if type(value) == "table" then
+			local depth = calculateTableDepth(value, currentDepth + 1)
+			if depth > maxDepth then
+				maxDepth = depth
+			end
+		end
+	end
+	return maxDepth
+end
+
+local function inspectPayload(args: any): (boolean, string?)
+	if type(args) == "string" then
+		if #args > CONFIG.MAX_STRING_SIZE then
+			return false, "Oversized string payload detected"
+		end
+	elseif type(args) == "table" then
+		if calculateTableDepth(args, 1) > CONFIG.MAX_TABLE_DEPTH then
+			return false, "Excessive table depth nesting recursion attempt"
+		end
+		
+		for key, val in pairs(args) do
+			local keyOk, keyErr = inspectPayload(key)
+			if not keyOk then return false, keyErr end
+			
+			local valOk, valErr = inspectPayload(val)
+			if not valOk then return false, valErr end
+		end
+	end
+	return true, nil
+end
+
+function AntiDdosManager.TrackPlayer(player: Player): RemoteLog
+	if networkLogs[player] then return networkLogs[player] end
+	
+	local log: RemoteLog = {
+		TotalCount = 0,
+		WindowStart = os.clock(),
+		PerRemote = {},
+		Violations = 0
+	}
+	
+	networkLogs[player] = log
+	return log
+end
+
+function AntiDdosManager:ProcessPunishment(player: Player, log: RemoteLog, reason: string)
+	log.Violations += 1
+	warn(string.format("[Network Security] Protocol breach by %s. Reason: %s. Infractions: %d/%d", player.Name, reason, log.Violations, CONFIG.VIOLATION_LIMIT))
+	
+	if log.Violations >= CONFIG.VIOLATION_LIMIT then
+		player:Kick("\n[Server Security] Packet drop enforced. Network flooding/malformed data packet restriction triggered.")
+	end
+end
+
+function AntiDdosManager:FilterInboundTraffic(player: Player, remote: Instance, ...: any): boolean
+	local log = self.TrackPlayer(player)
+	local now = os.clock()
+	local remoteName = remote.Name
+	
+	if now - log.WindowStart >= CONFIG.TIME_WINDOW then
+		log.TotalCount = 0
+		table.clear(log.PerRemote)
+		log.WindowStart = now
+	end
+	
+	log.TotalCount += 1
+	log.PerRemote[remoteName] = (log.PerRemote[remoteName] or 0) + 1
+	
+	if log.TotalCount > CONFIG.MAX_TOTAL_REQUESTS then
+		self:ProcessPunishment(player, log, "Global Remote Event Exhaustion (DoS)")
+		return false
+	end
+	
+	if log.PerRemote[remoteName] > CONFIG.MAX_SPECIFIC_REMOTE_REQ then
+		self:ProcessPunishment(player, log, "Targeted Remote Flooding: " .. remoteName)
+		return false
+	end
+	
+	local payloadArgs = {...}
+	local payloadOk, payloadError = inspectPayload(payloadArgs)
+	if not payloadOk then
+		self:ProcessPunishment(player, log, payloadError or "Malformed payload")
+		return false
+	end
+	
+	return true
+end
+
+function AntiDdosManager:UntrackPlayer(player: Player)
+	networkLogs[player] = nil
+end
+
+return AntiDdosManager]=]
+antiDdosManager.Parent = antiDdosSystem
+
+local antiDdosServer = Instance.new("Script")
+antiDdosServer.Name = "AntiDdosServer"
+antiDdosServer.Source = [=[--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local AntiDdosManager = require(script.Parent.AntiDdosManager)
+
+local function interceptRemoteEvent(remoteEvent: RemoteEvent)
+	local originalFire = remoteEvent.OnServerEvent
+	
+	remoteEvent.OnServerEvent:Connect(function(player, ...: any)
+		local args = {...}
+		local isTrafficSafe = AntiDdosManager:FilterInboundTraffic(player, remoteEvent, unpack(args))
+		
+		if not isTrafficSafe then
+			return
+		end
+	end)
+end
+
+local function scanNetworkNodes(root: Instance)
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("RemoteEvent") then
+			interceptRemoteEvent(descendant)
+		end
+	end
+	
+	root.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("RemoteEvent") then
+			interceptRemoteEvent(descendant)
+		end
+	end)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	AntiDdosManager:UntrackPlayer(player)
+end)
+
+scanNetworkNodes(ReplicatedStorage)
+]=]
+antiDdosServer.Parent = antiDdosSystem
